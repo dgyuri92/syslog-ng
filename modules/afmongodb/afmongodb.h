@@ -40,6 +40,15 @@ void afmongodb_dd_set_value_pairs(LogDriver *d, ValuePairs *vp);
 void afmongodb_dd_set_safe_mode(LogDriver *d, gboolean state);
 void afmongodb_dd_set_path(LogDriver *d, const gchar *path);
 
+void afmongodb_dd_set_cert(LogDriver *d, const gchar *path);
+void afmongodb_dd_set_ca(LogDriver *d, const gchar *path);
+void afmongodb_dd_set_key(LogDriver *d, const gchar *path, const gchar *pw);
+void afmongodb_dd_set_crl(LogDriver *d, const gchar *path);
+void afmongodb_dd_set_security(LogDriver *d, gboolean required, gboolean trusted);
+void afmongodb_dd_set_trusted_fps(LogDriver *d, GList *fingerprints);
+void afmongodb_dd_set_trusted_DNs(LogDriver *d, GList *DNs);
+
+
 gboolean afmongodb_dd_check_address(LogDriver *d, gboolean local);
 
 LogTemplateOptions *afmongodb_dd_get_template_options(LogDriver *s);

@@ -75,6 +75,8 @@ typedef struct
 
   GString *current_value;
   bson *bson;
+  /* SSL context */
+  mongo_ssl_ctx *ssl_ctx;
 } MongoDBDestDriver;
 
 /*
@@ -202,6 +204,103 @@ afmongodb_dd_set_safe_mode(LogDriver *d, gboolean state)
   self->safe_mode = state;
 }
 
+
+static gboolean
+afmongodb_ssl_ready (LogDriver *d)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *)d;
+
+  if (self->ssl_ctx == NULL)
+    {
+      self->ssl_ctx = g_new0 (mongo_ssl_ctx, 1);
+      if (self->ssl_ctx == NULL)
+        return FALSE;
+      return TRUE;
+    }
+
+  if (self->ssl_ctx->ctx == NULL)
+    {
+      if (!mongo_ssl_init (self->ssl_ctx))
+        {
+          msg_error ("Unable to initialize SSL context", NULL);
+          self->ssl_ctx = NULL;
+          return FALSE;
+        }
+    }
+
+  return TRUE;
+}
+
+void
+afmongodb_dd_set_ca(LogDriver *d, const gchar *path)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+  
+  if (!afmongodb_ssl_ready (d)) return;
+
+  if (!mongo_ssl_set_ca (self->ssl_ctx, path))
+      msg_warning ("Error setting CA certificate", evt_tag_str ("path", path), NULL);
+}
+
+void
+afmongodb_dd_set_cert(LogDriver *d, const gchar *path)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+
+  if (!mongo_ssl_set_cert (self->ssl_ctx, path))
+    msg_warning ("Error setting client certificate", evt_tag_str ("path", path), NULL);
+}
+
+void
+afmongodb_dd_set_key(LogDriver *d, const gchar *path, const gchar *pw)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+
+  if (!mongo_ssl_set_key (self->ssl_ctx, path, pw))
+    msg_warning ("Error setting client private key", evt_tag_str ("path", path), NULL);
+}
+
+void
+afmongodb_dd_set_crl(LogDriver *d, const gchar *path)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+
+  if (!mongo_ssl_set_crl (self->ssl_ctx, path))
+    msg_warning ("Error setting CRL file", evt_tag_str ("path", path), NULL);
+}
+
+
+void
+afmongodb_dd_set_security(LogDriver *d, gboolean required, gboolean trusted)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+  mongo_ssl_set_security (self->ssl_ctx, required, trusted); 
+}
+
+void afmongodb_dd_set_trusted_fps(LogDriver *d, GList *fingerprints)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+  mongo_ssl_set_trusted_fingerprints (self->ssl_ctx, fingerprints);
+}
+
+void afmongodb_dd_set_trusted_DNs(LogDriver *d, GList *DNs)
+{
+  MongoDBDestDriver *self = (MongoDBDestDriver *) d;
+
+  if (!afmongodb_ssl_ready (d)) return;
+  mongo_ssl_set_trusted_DNs (self->ssl_ctx, DNs);
+}
+
 /*
  * Utilities
  */
@@ -253,11 +352,79 @@ afmongodb_dd_connect(MongoDBDestDriver *self, gboolean reconnect)
   if (reconnect && self->conn)
     return TRUE;
 
-  self->conn = mongo_sync_connect(self->address, self->port, FALSE);
-  if (!self->conn)
+  if (!afmongodb_ssl_ready ((LogDriver *) self))
     {
-      msg_error ("Error connecting to MongoDB", NULL);
-      return FALSE;
+      self->conn = mongo_sync_connect(self->address, self->port, FALSE);
+      if (!self->conn)
+        {
+          msg_error ("Error connecting to MongoDB", NULL);
+          return FALSE;
+        }
+    }
+  else
+    {
+      self->conn = mongo_sync_ssl_connect(self->address, self->port, FALSE, self->ssl_ctx);
+      if (!self->conn)
+        {
+          gchar *reason_string = NULL;
+          gchar *verify_status = NULL;
+          switch (mongo_ssl_get_last_verify_result(self->ssl_ctx))
+            {
+              case MONGO_SSL_V_UNDEF: 
+                verify_status = g_strdup ("Undefined"); 
+                break;
+              
+              case MONGO_SSL_V_ERR_NO_CERT: 
+                verify_status = g_strdup ("Server certificate expected but not received");
+                break;
+
+              case MONGO_SSL_V_ERR_SNI:
+                verify_status = g_strdup ("Hostname check failed");
+                break;
+
+              case MONGO_SSL_V_ERR_UNTRUSTED_FP:
+                verify_status = g_strdup ("Certificate fingerprint is not trusted");
+                break;
+
+              case MONGO_SSL_V_ERR_UNTRUSTED_DN:
+                verify_status = g_strdup ("Certificate subject DN is not trusted");
+                break;
+
+              case MONGO_SSL_V_ERR_PROTO:
+                verify_status = g_strdup ("Certificate validation failed");
+                break;
+
+              case MONGO_SSL_V_OK_TRUSTED_FP:
+                verify_status = g_strdup ("Certificate accepted because its fingerprint is listed");
+                break;
+
+              case MONGO_SSL_V_OK_NO_HOSTNAME:
+                verify_status = g_strdup ("Session validation successful but no hostname was provided to check");
+                break;
+
+              case MONGO_SSL_V_OK_NO_VERIFY:
+                verify_status = g_strdup ("Session validation successful, but certificate may be invalid (trust was not required)");
+                break;
+              
+              case MONGO_SSL_V_OK_ALL:
+                verify_status = g_strdup ("Full verification completed successfully");
+                break;
+
+              default:
+                g_assert_not_reached ();
+            }
+
+          reason_string = 
+            g_strdup_printf ("Last OpenSSL error: %s, Last verification status: %s, Last verification error: %s",
+                             mongo_ssl_get_last_error(self->ssl_ctx),
+                             verify_status,
+                             mongo_ssl_get_last_verify_error(self->ssl_ctx)
+                            );
+
+          msg_error ("Error connecting to MongoDB via SSL", evt_tag_str("reason", reason_string),  NULL);
+          g_free (verify_status);
+          g_free (reason_string);
+        }
     }
 
   mongo_sync_conn_set_safe_mode(self->conn, self->safe_mode);
@@ -626,6 +793,7 @@ afmongodb_dd_init(LogPipe *s)
   return log_threaded_dest_driver_start(s);
 }
 
+
 static void
 afmongodb_dd_free(LogPipe *d)
 {
@@ -643,6 +811,9 @@ afmongodb_dd_free(LogPipe *d)
     value_pairs_free(self->vp);
 
   log_threaded_dest_driver_free(d);
+
+  mongo_ssl_clear(self->ssl_ctx);
+  g_free (self->ssl_ctx);
 }
 
 static void
@@ -703,6 +874,7 @@ gboolean
 afmongodb_module_init(GlobalConfig *cfg, CfgArgs *args)
 {
   plugin_register(cfg, &afmongodb_plugin, 1);
+  mongo_ssl_util_init_lib (); // TODO: Where to call mongo_ssl_util_cleanup_lib () ???
   return TRUE;
 }
 
